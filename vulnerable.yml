@@ -1,0 +1,544 @@
+---
+# Save as: /mnt/d/ansible/script3.yml
+# Prereqs (run once):
+#   sudo apt-get update && sudo apt-get install -y libpangocairo-1.0-0 libpango-1.0-0 libcairo2 libffi-dev fonts-dejavu
+#   pip install --upgrade pip && pip install weasyprint pandas
+#   ansible-galaxy collection install community.general
+# Gmail: use a Gmail App Password (Google Account > Security > 2-Step Verification > App Passwords)
+
+- name: ACS Image Vulnerability Report & Weekly Email (send immediately and on Monday schedule)
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  collections:
+    - community.general
+
+  vars_prompt:
+    - name: acs_api_token
+      prompt: "Enter your ACS API token"
+      private: yes
+    - name: central_url
+      prompt: "Enter ACS Central API URL (e.g., https://central.example.com)"
+    - name: smtp_password
+      prompt: "Enter your Gmail App Password"
+      private: yes
+
+  vars:
+    report_dir: "/home/user1/vulnerable-report"
+    history_file: "{{ report_dir }}/last_critical_snapshot.json"
+
+    # Email
+    smtp_server: "smtp.gmail.com"
+    email_from: "amrutambakare@gmail.com"     # <-- your Gmail
+    email_to:
+      - "amrutambakare@gmail.com"              # <-- recipient(s)
+    email_subject_prefix: "ACS Weekly Image Vulnerability Report"
+
+    # PDF layout
+    page_size: "A3"        # A3 avoids clipping; change to "A4" if you prefer
+    base_font_pt: 9
+
+    # Email send rule
+    send_only_on_wednesday: false  # disabled; now we send immediately + Monday cron
+
+  pre_tasks:
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    # Freeze one timestamp per run so all file paths match
+    - name: Compute run_id once per run
+      ansible.builtin.set_fact:
+        run_id: "{{ lookup('pipe','date +%Y-%m-%d_%H%M') }}"
+
+    - name: Build file paths for this run
+      ansible.builtin.set_fact:
+        raw_images_path: "{{ report_dir }}/raw_images_{{ run_id }}.json"
+        json_path: "{{ report_dir }}/images_vuln_report_{{ run_id }}.json"
+        crit_snapshot_path: "{{ report_dir }}/critical_snapshot_{{ run_id }}.json"
+        pdf_path: "{{ report_dir }}/images_vuln_report_{{ run_id }}.pdf"
+
+  tasks:
+    # Gmail reachability (diagnostic only)
+    - name: Resolve smtp.gmail.com (non-fatal)
+      ansible.builtin.command: getent hosts {{ smtp_server }}
+      register: dns_check
+      changed_when: false
+      failed_when: false
+
+    - name: TCP test to Gmail ports (non-fatal)
+      ansible.builtin.wait_for:
+        host: "{{ smtp_server }}"
+        port: "{{ item }}"
+        timeout: 5
+      loop: [587, 465]
+      register: port_checks
+      changed_when: false
+      failed_when: false
+
+    - name: Show Gmail DNS/port checks
+      ansible.builtin.debug:
+        msg:
+          - "DNS: {{ dns_check.stdout | default('no DNS output') }}"
+          - "587 reachable: {{ (port_checks.results | selectattr('item','equalto',587) | list | first).elapsed is defined }}"
+          - "465 reachable: {{ (port_checks.results | selectattr('item','equalto',465) | list | first).elapsed is defined }}"
+
+    # 1) Fetch images from ACS list endpoint
+    - name: Get all images
+      ansible.builtin.uri:
+        url: "{{ central_url }}/v1/images"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ acs_api_token }}"
+        return_content: yes
+        validate_certs: no
+      register: images
+      until: images.status == 200
+      retries: 3
+      delay: 10
+
+    - name: Save raw ACS images to temp file
+      ansible.builtin.copy:
+        dest: "{{ raw_images_path }}"
+        content: "{{ images.json.images | default([]) | to_nice_json }}"
+        mode: "0644"
+
+    # 2) Build accurate counts (CVEs, Fixable, Critical, Fixable Critical)
+    - name: Generate summary records JSON and critical snapshot (deep fetch if needed)
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json, os, ssl, urllib.request, urllib.parse
+
+        RAW_PATH = os.environ["RAW_IMAGES_PATH"]
+        OUT_PATH = os.environ["OUT_JSON_PATH"]
+        CRIT_PATH = os.environ["CRIT_SNAPSHOT_PATH"]
+        CENTRAL = os.environ["CENTRAL_URL"].rstrip("/")
+        TOKEN   = os.environ["ACS_TOKEN"]
+
+        def http_get_json(url):
+          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+          ctx = ssl._create_unverified_context()
+          with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+        def safe_get(d, *keys, default=None):
+          cur = d
+          for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+              return default
+            cur = cur[k]
+          return cur
+
+        def to_int(x, default=0):
+          try:
+            return int(x)
+          except Exception:
+            try:
+              return int(float(x))
+            except Exception:
+              return default
+
+        with open(RAW_PATH, "r", encoding="utf-8") as f:
+          imgs = json.load(f)
+        if not isinstance(imgs, list):
+          imgs = []
+
+        records = []
+
+        for img in imgs:
+          img_id = str(img.get("id", "")) or ""
+
+          # Image full name
+          name_field = img.get("name", "")
+          if isinstance(name_field, dict):
+            full = name_field.get("fullName")
+            if not full:
+              reg = name_field.get("registry", "") or ""
+              rem = name_field.get("remote", "") or ""
+              tag = name_field.get("tag", "") or ""
+              full = (reg + "/" + rem).strip("/")
+              if tag:
+                full += f":{tag}"
+          else:
+            full = str(name_field)
+
+          scan = img.get("scan") or {}
+          comps = scan.get("components")
+          if isinstance(comps, list):
+            components_count = len(comps)
+          else:
+            components_count = to_int(img.get("componentCount", 0))
+
+          # Aggregate vulnerabilities
+          vlist = []
+          top_v = scan.get("vulnerabilities")
+          if isinstance(top_v, list):
+            vlist.extend(top_v)
+          if isinstance(comps, list):
+            for c in comps:
+              vl = c.get("vulns") or c.get("vulnerabilities")
+              if isinstance(vl, list):
+                vlist.extend(vl)
+
+          def cve_id(v):
+            return v.get("cve") or v.get("cveId") or v.get("name") or v.get("id") or v.get("cve_id")
+
+          def is_fixable(v):
+            return bool(v.get("isFixable") or v.get("fixedBy") or v.get("fixedIn") or v.get("hasFix"))
+
+          def sev(v):
+            s = v.get("severity") or safe_get(v, "cvss", "severity")
+            if isinstance(s, str):
+              return s.lower()
+            return ""
+
+          uniq = {}
+          for v in vlist or []:
+            key = cve_id(v)
+            if not key:
+              continue
+            entry = uniq.setdefault(key, {"fixable": False, "sev": set()})
+            if is_fixable(v):
+              entry["fixable"] = True or entry["fixable"]
+            sv = sev(v)
+            if sv:
+              entry["sev"].add(sv)
+
+          total_cves = len(uniq)
+          fixable_cves = sum(1 for e in uniq.values() if e["fixable"])
+          crit_total = sum(1 for e in uniq.values() if any("critical" in s for s in e["sev"]))
+          crit_fix   = sum(1 for e in uniq.values() if any("critical" in s for s in e["sev"]) and e["fixable"])
+
+          # Fallback to counters if lists missing
+          for path, assign in [
+            (("cvesCount",), "total_cves"),
+            (("fixableCvesCount",), "fixable_cves"),
+            (("criticalCvesCount",), "crit_total"),
+            (("fixableCriticalCvesCount",), "crit_fix"),
+            (("vulnerabilityCounter","all"), "total_cves"),
+            (("vulnerabilityCounter","fixable"), "fixable_cves"),
+            (("vulnerabilityCounter","critical"), "crit_total"),
+            (("vulnerabilityCounter","fixableCritical"), "crit_fix"),
+          ]:
+            val = safe_get(img, *path)
+            if assign == "total_cves"   and total_cves   == 0 and val is not None: total_cves   = to_int(val, total_cves)
+            if assign == "fixable_cves" and fixable_cves == 0 and val is not None: fixable_cves = to_int(val, fixable_cves)
+            if assign == "crit_total"   and crit_total   == 0 and val is not None: crit_total   = to_int(val, crit_total)
+            if assign == "crit_fix"     and crit_fix     == 0 and val is not None: crit_fix     = to_int(val, crit_fix)
+
+          # Deep fetch details if still zero and we have an id
+          if img_id and total_cves == 0 and fixable_cves == 0 and crit_total == 0:
+            try:
+              detail = http_get_json(f"{CENTRAL}/v1/images/{urllib.parse.quote(img_id, safe='')}")
+              dscan = detail.get("scan") or {}
+              dcomps = dscan.get("components")
+              dv = []
+              tv = dscan.get("vulnerabilities")
+              if isinstance(tv, list):
+                dv.extend(tv)
+              if isinstance(dcomps, list):
+                for c in dcomps:
+                  vl = c.get("vulns") or c.get("vulnerabilities")
+                  if isinstance(vl, list):
+                    dv.extend(vl)
+              uniq = {}
+              for v in dv or []:
+                key = cve_id(v)
+                if not key:
+                  continue
+                entry = uniq.setdefault(key, {"fixable": False, "sev": set()})
+                if is_fixable(v):
+                  entry["fixable"] = True or entry["fixable"]
+                sv = sev(v)
+                if sv:
+                  entry["sev"].add(sv)
+              total_cves = len(uniq)
+              fixable_cves = sum(1 for e in uniq.values() if e["fixable"])
+              crit_total = sum(1 for e in uniq.values() if any("critical" in s for s in e["sev"]))
+              crit_fix   = sum(1 for e in uniq.values() if any("critical" in s for s in e["sev"]) and e["fixable"])
+            except Exception:
+              pass
+
+          meta = img.get("metadata") or {}
+          created = meta.get("created") or img.get("createdAt") or img.get("created") or ""
+          updated = meta.get("lastUpdated") or img.get("updatedAt") or img.get("scanTime") or ""
+
+          records.append({
+            "ID": img_id,
+            "Image Name": full,
+            "Components": components_count,
+            "CVEs": total_cves,
+            "Fixable CVEs": fixable_cves,
+            "Critical CVEs": crit_total,
+            "Fixable Critical CVEs": crit_fix,
+            "Created": created,
+            "Last Updated": updated,
+          })
+
+        with open(OUT_PATH, "w", encoding="utf-8") as f:
+          json.dump(records, f, indent=2, ensure_ascii=False)
+
+        crit_snapshot = [
+          {"ID": r["ID"], "Critical CVEs": r["Critical CVEs"], "Fixable Critical CVEs": r["Fixable Critical CVEs"]}
+          for r in records if (r.get("Critical CVEs", 0) or 0) > 0
+        ]
+        with open(CRIT_PATH, "w", encoding="utf-8") as f:
+          json.dump(crit_snapshot, f, indent=2, ensure_ascii=False)
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        RAW_IMAGES_PATH: "{{ raw_images_path }}"
+        OUT_JSON_PATH: "{{ json_path }}"
+        CRIT_SNAPSHOT_PATH: "{{ crit_snapshot_path }}"
+        CENTRAL_URL: "{{ central_url }}"
+        ACS_TOKEN: "{{ acs_api_token }}"
+
+    # 3) Load records and create PDF (A3 landscape, fixed widths, wrapping)
+    - name: Load summary records
+      ansible.builtin.slurp:
+        src: "{{ json_path }}"
+      register: records_json
+
+    - name: Set image_vuln_records fact
+      ansible.builtin.set_fact:
+        image_vuln_records: "{{ records_json.content | b64decode | from_json }}"
+
+    - name: Load current critical snapshot
+      ansible.builtin.slurp:
+        src: "{{ crit_snapshot_path }}"
+      register: crit_now_json
+
+    - name: Set current critical snapshot fact
+      ansible.builtin.set_fact:
+        current_critical_snapshot: "{{ crit_now_json.content | b64decode | from_json }}"
+
+    - name: Create image PDF report (landscape, styled)
+      ansible.builtin.shell: |
+        {% raw %}
+        python3 - <<'PY'
+        import json, os, datetime
+        try:
+            import pandas as pd
+            from weasyprint import HTML
+        except Exception as e:
+            print(f"Skipping PDF (missing packages): {e}")
+            raise SystemExit(0)
+
+        json_path = os.environ["JSON_PATH"]
+        pdf_path  = os.environ["PDF_PATH"]
+        page_size = os.environ.get("PAGE_SIZE","A3")
+        base_pt   = int(os.environ.get("BASE_PT","9"))
+
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.loads(f.read())
+        if not isinstance(data, list):
+            data = []
+
+        cols = ['ID','Image Name','Components','CVEs','Fixable CVEs','Critical CVEs','Fixable Critical CVEs','Created','Last Updated']
+        for row in data:
+            for c in cols:
+                if c not in row:
+                    row[c] = ''
+        df = pd.DataFrame(data, columns=cols)
+
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        total = len(df)
+
+        css = f"""
+        @page {{ size: {page_size} landscape; margin: 8mm; }}
+        body {{ font-family: DejaVu Sans, Arial, Helvetica, sans-serif; font-size: {base_pt}pt; color: #2d3e50; }}
+        h1 {{ font-size: {base_pt+17}pt; margin: 0 0 8px 0; color: #2c3e50; }}
+        .meta {{ margin: 0 0 10px 0; font-size: {base_pt-0.5}pt; color: #556; }}
+        table.report {{ width: 100%; border-collapse: collapse; table-layout: fixed; box-sizing: border-box; }}
+        thead {{ display: table-header-group; }}
+        tfoot {{ display: table-row-group; }}
+        tr {{ page-break-inside: avoid; }}
+        table.report th, table.report td {{ border: 1px solid #dfe3e8; padding: 5px 6px; vertical-align: top; box-sizing: border-box; }}
+        table.report th {{ background: #f5f7fb; font-weight: 600; }}
+        table.report td, table.report th {{ word-break: break-word; overflow-wrap: anywhere; white-space: normal; hyphens: auto; }}
+        /* columns sum to 100% */
+        table.report th:nth-child(1),  table.report td:nth-child(1)  {{ width: 20%; }}
+        table.report th:nth-child(2),  table.report td:nth-child(2)  {{ width: 34%; }}
+        table.report th:nth-child(3),  table.report td:nth-child(3)  {{ width: 5%;  text-align: right; }}
+        table.report th:nth-child(4),  table.report td:nth-child(4)  {{ width: 5%;  text-align: right; }}
+        table.report th:nth-child(5),  table.report td:nth-child(5)  {{ width: 6%;  text-align: right; }}
+        table.report th:nth-child(6),  table.report td:nth-child(6)  {{ width: 6%;  text-align: right; }}
+        table.report th:nth-child(7),  table.report td:nth-child(7)  {{ width: 7%;  text-align: right; }}
+        table.report th:nth-child(8),  table.report td:nth-child(8)  {{ width: 8%; }}
+        table.report th:nth-child(9),  table.report td:nth-child(9)  {{ width: 9%; }}
+        """
+
+        table_html = "<p>No images found.</p>" if df.empty else df.to_html(index=False, escape=False, classes='report')
+        html = f"""<!DOCTYPE html>
+        <html><head><meta charset="utf-8"><style>{css}</style></head>
+        <body>
+          <h1>ACS Image Vulnerability Report</h1>
+          <div class="meta">Generated on: {now} | Total Images: {total}</div>
+          {table_html}
+        </body></html>"""
+
+        HTML(string=html).write_pdf(pdf_path)
+        PY
+        {% endraw %}
+      args:
+        executable: /bin/bash
+      environment:
+        JSON_PATH: "{{ json_path }}"
+        PDF_PATH: "{{ pdf_path }}"
+        PAGE_SIZE: "{{ page_size }}"
+        BASE_PT: "{{ base_font_pt }}"
+      register: pdf_result
+      changed_when: true
+
+    # 4) Decide if we send email (now immediate send enabled)
+    - name: Check if history file exists
+      ansible.builtin.stat:
+        path: "{{ history_file }}"
+      register: hist_stat
+
+    - name: Load last critical snapshot (if exists)
+      ansible.builtin.slurp:
+        src: "{{ history_file }}"
+      register: last_crit_json
+      when: hist_stat.stat.exists
+
+    - name: Set last critical snapshot fact
+      ansible.builtin.set_fact:
+        last_critical_snapshot: "{{ (last_crit_json.content | b64decode | from_json) if (hist_stat.stat.exists | default(false)) else [] }}"
+
+    - name: Sort snapshots for stable comparison
+      ansible.builtin.set_fact:
+        current_crit_sorted: "{{ current_critical_snapshot | sort(attribute='ID') }}"
+        last_crit_sorted: "{{ (last_critical_snapshot | sort(attribute='ID')) if (last_critical_snapshot is defined) else [] }}"
+
+    - name: Compute flags (have_critical, changed_critical)
+      ansible.builtin.set_fact:
+        have_critical: "{{ (current_critical_snapshot | length) > 0 }}"
+        changed_critical: "{{ (current_crit_sorted | to_nice_json) != (last_crit_sorted | default([]) | to_nice_json) }}"
+
+    - name: Compute send_email_condition
+      ansible.builtin.set_fact:
+        send_email_condition: "{{ (have_critical and changed_critical) }}"   # immediate send
+
+    - name: Show send decision
+      ansible.builtin.debug:
+        msg: "Send email? {{ send_email_condition }} (critical_count={{ current_critical_snapshot | length }}, changed={{ changed_critical }})"
+
+    # Attachments
+    - name: Stat JSON/PDF files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: report_files_stat
+      loop: [ "{{ json_path }}", "{{ pdf_path }}" ]
+
+    - name: Build attachment list (existing files only)
+      ansible.builtin.set_fact:
+        attachment_paths: "{{ report_files_stat.results | selectattr('stat.exists','defined') | selectattr('stat.exists') | map(attribute='stat.path') | list }}"
+
+    # 5) Email (send immediately if condition met)
+    - block:
+        - name: Send weekly report email via 587 STARTTLS
+          community.general.mail:
+            host: "{{ smtp_server }}"
+            port: 587
+            secure: starttls
+            timeout: 45
+            username: "{{ email_from }}"
+            password: "{{ smtp_password }}"
+            to: "{{ email_to }}"
+            from: "{{ email_from }}"
+            subject: "{{ email_subject_prefix }} - {{ run_id }}"
+            body: |
+              Summary (sent immediately if critical changed)
+              - Images with Critical CVEs: {{ current_critical_snapshot | length }}
+
+              Top 10 critical images:
+              {% for r in (image_vuln_records | selectattr('Critical CVEs','gt',0) | list)[:10] %}
+              - {{ r['Image Name'] }} | Critical: {{ r['Critical CVEs'] }} | Fixable Critical: {{ r['Fixable Critical CVEs'] }}
+              {% endfor %}
+
+              See attached JSON/PDF for full details.
+            attach: "{{ attachment_paths if (attachment_paths | length) > 0 else omit }}"
+          register: mail_result_587
+          when: send_email_condition
+          retries: 5
+          delay: 6
+          until: mail_result_587 is succeeded
+      rescue:
+        - name: Send weekly report email via 465 implicit TLS (fallback)
+          community.general.mail:
+            host: "{{ smtp_server }}"
+            port: 465
+            secure: always
+            timeout: 45
+            username: "{{ email_from }}"
+            password: "{{ smtp_password }}"
+            to: "{{ email_to }}"
+            from: "{{ email_from }}"
+            subject: "{{ email_subject_prefix }} - {{ run_id }}"
+            body: |
+              Summary (TLS 465 fallback)
+              - Images with Critical CVEs: {{ current_critical_snapshot | length }}
+
+              See attached JSON/PDF for full details.
+            attach: "{{ attachment_paths if (attachment_paths | length) > 0 else omit }}"
+          when: send_email_condition
+
+    # 6) Save snapshot for next comparison
+    - name: Save current critical snapshot
+      ansible.builtin.copy:
+        dest: "{{ history_file }}"
+        content: "{{ current_critical_snapshot | to_nice_json }}"
+        mode: "0644"
+
+
+# 7) Weekly schedule (Monday 10:00) — user crontab, no sudo needed
+- name: Ensure weekly schedule exists (Monday 10:00) [user cron]
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    repo_dir: "/mnt/d/ansible"                         # folder containing this playbook
+    playbook_filename: "script3.yml"                   # this file's name
+    run_script_path: "{{ lookup('env','HOME') }}/.local/bin/run_vuln_report.sh"
+    log_dir: "{{ lookup('env','HOME') }}/.ansible_logs"
+    log_path: "{{ log_dir }}/vuln-report.log"
+
+  tasks:
+    - name: Ensure ~/.local/bin exists
+      ansible.builtin.file:
+        path: "{{ run_script_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure user log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install runner script used by cron (user)
+      ansible.builtin.copy:
+        dest: "{{ run_script_path }}"
+        mode: "0700"
+        content: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          REPO_DIR="{{ repo_dir }}"
+          PLAYBOOK="{{ playbook_filename }}"
+          LOG="{{ log_path }}"
+          ANSIBLE_PLAYBOOK_BIN="$(command -v ansible-playbook || echo /usr/bin/ansible-playbook)"
+          cd "$REPO_DIR"
+          "$ANSIBLE_PLAYBOOK_BIN" -i "localhost," "$PLAYBOOK" >> "$LOG" 2>&1
+
+    - name: Ensure user cron job exists (Monday 10:00)
+      ansible.builtin.cron:
+        name: "ACS weekly image vulnerability report (send only if critical changed)"
+        minute: "0"
+        hour: "10"
+        weekday: "1"
+        job: "{{ run_script_path }}"
