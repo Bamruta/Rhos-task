@@ -1,0 +1,75 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-vm-simple
+  namespace: test-vm
+  labels:
+    kubevirt.io/domain: ubuntu-vm-simple
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: ubuntu-vm-simple
+    spec:
+      domain:
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: 1
+        devices:
+          disks:
+            - name: rootdisk
+              bootOrder: 1
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              bootOrder: 2
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              bridge: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          containerDisk:
+            image: quay.io/containerdisks/ubuntu:22.04
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              users:
+                - name: ubuntu
+                  sudo: ['ALL=(ALL) NOPASSWD:ALL']
+                  shell: /bin/bash
+                  lock_passwd: false
+                  plain_text_passwd: ubuntu123
+              ssh_pwauth: true
+              package_update: true
+              packages:
+                - openssh-server
+                - net-tools
+                - curl
+              runcmd:
+                - systemctl enable ssh
+                - systemctl start ssh
+                - echo 'ubuntu:ubuntu123' | chpasswd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ubuntu-vm-simple-ssh
+  namespace: test-vm
+spec:
+  selector:
+    kubevirt.io/domain: ubuntu-vm-simple
+  ports:
+    - name: ssh
+      protocol: TCP
+      port: 22
+      targetPort: 22
+      nodePort: 30422
+  type: NodePort
